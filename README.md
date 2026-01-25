@@ -15,7 +15,7 @@ A time series dashboard for modeling and forecasting S&P 500 volatility using GA
 - **Frequency**: Daily data
 
 ## Tech Stack
-- Python 3.9+
+- Python 3.12
 - ARCH library for GARCH models
 - Plotly Dash for interactive dashboard
 - Alpha Vantage API for market data
