@@ -13,6 +13,7 @@ Architecture
   (created dynamically) to be wired up before they exist in the layout.
 """
 
+import io
 import os
 import sys
 import json
@@ -84,7 +85,7 @@ def _df_to_json(df: pd.DataFrame) -> str | None:
 def _json_to_df(s: str | None) -> pd.DataFrame | None:
     if not s:
         return None
-    df = pd.read_json(s, orient="split")
+    df = pd.read_json(io.StringIO(s), orient="split")
     # Try to coerce the index to DatetimeIndex
     try:
         df.index = pd.to_datetime(df.index)
