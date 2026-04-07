@@ -1,7 +1,3 @@
-
-# PROJECT: Univariate GARCH(1,1) + DCC-GARCH(1,1)
-
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -26,7 +22,6 @@ except ImportError:
     HAS_PINGOUIN = False
 
 
-
 # 1. CONFIG
 
 START_DATE = "2016-01-01"
@@ -47,7 +42,6 @@ VIX_TICKER = "^VIX"
 LAGS = 20
 DIST = "normal"           # "normal" or "t" for univariate GARCH
 PLOT_DIR_PREFIX = "plots_"  # just for naming titles, no saving to disk by default
-
 
 
 # 2. DATA HELPERS
@@ -87,18 +81,17 @@ def download_prices(tickers, start, end):
         tickers = [tickers]
 
     session = _yf_session()
-    frames  = {}
-    failed  = []
+    frames = {}
+    failed = []
 
-    # ── per-ticker fetch (most reliable on cloud) ─────────────────────────────
+    # per-ticker fetch
     for ticker in tickers:
         for attempt in range(3):
             try:
-                t    = yf.Ticker(ticker, session=session)
+                t = yf.Ticker(ticker, session=session)
                 hist = t.history(start=start, end=end, auto_adjust=True)
                 if not hist.empty:
                     close = hist["Close"].copy()
-                    # strip timezone so all indices are tz-naive
                     if hasattr(close.index, "tz") and close.index.tz is not None:
                         close.index = close.index.tz_localize(None)
                     frames[ticker] = close
@@ -107,16 +100,20 @@ def download_prices(tickers, start, end):
                     failed.append(ticker)
             except Exception:
                 if attempt < 2:
-                    time.sleep(1 + attempt)   # brief back-off
+                    time.sleep(1 + attempt)
                 else:
                     failed.append(ticker)
 
-    # ── batch fallback for any that failed above ──────────────────────────────
+    # batch fallback
     if failed:
         try:
             batch = yf.download(
-                failed, start=start, end=end,
-                auto_adjust=True, progress=False, threads=False,
+                failed,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
             )
             if not batch.empty:
                 close_batch = batch["Close"] if "Close" in batch.columns else batch
@@ -127,13 +124,12 @@ def download_prices(tickers, start, end):
                 for col in close_batch.columns:
                     frames[col] = close_batch[col]
         except Exception:
-            pass   # will surface as empty df below
+            pass
 
     if not frames:
         raise RuntimeError(
             f"download_prices: could not fetch any data for {tickers} "
-            f"({start} → {end}).  "
-            "Check ticker symbols, date range, and network access."
+            f"({start} → {end}). Check ticker symbols, date range, and network access."
         )
 
     data = pd.DataFrame(frames)
@@ -155,7 +151,6 @@ def realized_variance_proxy(returns, window=21):
     For true RV you would use intraday returns.
     """
     return returns.pow(2).rolling(window).sum()
-
 
 
 # 3. UNIVARIATE GARCH
@@ -183,9 +178,12 @@ def fit_univariate_garch(series, dist="normal"):
         "bic": res.bic,
         "loglik": res.loglikelihood,
         "params": res.params,
-        "conditional_vol": res.conditional_volatility / 100.0,  # back to decimal-return scale
+        "conditional_vol": res.conditional_volatility / 100.0,
         "resid": res.resid / 100.0,
-        "std_resid": pd.Series(res.std_resid, index=series.dropna().index).replace([np.inf, -np.inf], np.nan).dropna()
+        "std_resid": pd.Series(
+            res.std_resid,
+            index=series.dropna().index
+        ).replace([np.inf, -np.inf], np.nan).dropna()
     }
     return out
 
@@ -246,7 +244,6 @@ def plot_univariate_diagnostics(name, std_resid, cond_var, actual_returns):
     plt.show()
 
 
-
 # 4. DCC-GARCH
 
 class DCCGARCH:
@@ -255,9 +252,8 @@ class DCCGARCH:
     Step 1: use standardized residuals from univariate GARCHs
     Step 2: estimate DCC parameters (a, b) by maximizing DCC log-likelihood
 
-    References/assumptions:
-    - Q_t = (1-a-b)Qbar + a * e_{t-1}e_{t-1}' + b * Q_{t-1}
-    - R_t = diag(Q_t)^(-1/2) Q_t diag(Q_t)^(-1/2)
+    Q_t = (1-a-b)Qbar + a * e_{t-1}e_{t-1}' + b * Q_{t-1}
+    R_t = diag(Q_t)^(-1/2) Q_t diag(Q_t)^(-1/2)
 
     Inputs:
     E: T x N matrix of standardized residuals
@@ -273,14 +269,17 @@ class DCCGARCH:
         self.E_ = None
         self.sigmas_ = None
         self.loglik_ = None
+        self.index_ = None
+        self.columns_ = None
 
     @staticmethod
     def _dcc_recursion(params, E, Qbar):
         a, b = params
+        E = np.asarray(E, dtype=float)
         T, N = E.shape
 
-        Q_t = np.zeros((T, N, N))
-        R_t = np.zeros((T, N, N))
+        Q_t = np.zeros((T, N, N), dtype=float)
+        R_t = np.zeros((T, N, N), dtype=float)
 
         Q_t[0] = Qbar.copy()
 
@@ -289,9 +288,17 @@ class DCCGARCH:
                 et_1 = E[t - 1].reshape(-1, 1)
                 Q_t[t] = (1 - a - b) * Qbar + a * (et_1 @ et_1.T) + b * Q_t[t - 1]
 
-            q_diag = np.sqrt(np.diag(Q_t[t]))
-            inv_q_diag = np.diag(1.0 / q_diag)
-            R_t[t] = inv_q_diag @ Q_t[t] @ inv_q_diag
+            diag_q = np.diag(Q_t[t]).copy()
+
+            # Numerical safeguard for zero/negative diagonal entries
+            if np.any(diag_q <= 0):
+                diag_q = np.maximum(diag_q, 1e-10)
+
+            inv_sqrt_diag = np.diag(1.0 / np.sqrt(diag_q))
+            R_t[t] = inv_sqrt_diag @ Q_t[t] @ inv_sqrt_diag
+
+            # Keep symmetry numerically
+            R_t[t] = 0.5 * (R_t[t] + R_t[t].T)
 
         return Q_t, R_t
 
@@ -299,31 +306,36 @@ class DCCGARCH:
     def _negative_loglik(params, E, Qbar):
         a, b = params
 
-        # constraints
+        # Constraints
         if a < 0 or b < 0 or (a + b) >= 0.999:
             return 1e12
 
+        E = np.asarray(E, dtype=float)
         T, N = E.shape
+
         _, R_t = DCCGARCH._dcc_recursion(params, E, Qbar)
 
         nll = 0.0
         for t in range(T):
             Rt = R_t[t]
-            et = E[t].reshape(-1, 1)
+            et = E[t].reshape(-1)   # 1D vector, shape (N,)
 
             try:
                 sign, logdet = np.linalg.slogdet(Rt)
-                if sign <= 0:
+                if sign <= 0 or not np.isfinite(logdet):
                     return 1e12
+
                 invRt = np.linalg.inv(Rt)
             except np.linalg.LinAlgError:
                 return 1e12
 
-            term = logdet + float(et.T @ invRt @ et)
-            nll += term
+            quad = et @ invRt @ et
+            if not np.isfinite(quad):
+                return 1e12
 
-        # ignore constants
-        return 0.5 * nll
+            nll += logdet + quad
+
+        return 0.5 * float(nll)
 
     def fit(self, E, sigmas):
         """
@@ -332,20 +344,39 @@ class DCCGARCH:
         """
         if isinstance(E, pd.DataFrame):
             idx = E.index
-            cols = E.columns
-            Evals = E.values
+            cols = list(E.columns)
+            Evals = E.to_numpy(dtype=float)
         else:
-            idx = None
-            cols = None
-            Evals = np.asarray(E)
+            Evals = np.asarray(E, dtype=float)
+            idx = pd.RangeIndex(start=0, stop=Evals.shape[0], step=1)
+            cols = [f"Asset_{i}" for i in range(Evals.shape[1])]
 
-        sigmas_vals = sigmas.values if isinstance(sigmas, pd.DataFrame) else np.asarray(sigmas)
+        if isinstance(sigmas, pd.DataFrame):
+            sigmas_vals = sigmas.to_numpy(dtype=float)
+        else:
+            sigmas_vals = np.asarray(sigmas, dtype=float)
+
+        if Evals.ndim != 2:
+            raise ValueError(f"E must be 2D, got shape {Evals.shape}")
+        if sigmas_vals.ndim != 2:
+            raise ValueError(f"sigmas must be 2D, got shape {sigmas_vals.shape}")
+        if Evals.shape != sigmas_vals.shape:
+            raise ValueError(f"E and sigmas must have same shape, got {Evals.shape} vs {sigmas_vals.shape}")
+
+        if np.isnan(Evals).any() or np.isinf(Evals).any():
+            raise ValueError("E contains NaN or inf values")
+        if np.isnan(sigmas_vals).any() or np.isinf(sigmas_vals).any():
+            raise ValueError("sigmas contains NaN or inf values")
 
         self.E_ = Evals
         self.sigmas_ = sigmas_vals
-        self.Qbar_ = np.cov(Evals.T)
+        self.index_ = idx
+        self.columns_ = cols
 
-        x0 = np.array([0.02, 0.95])
+        self.Qbar_ = np.cov(Evals, rowvar=False)
+        self.Qbar_ = 0.5 * (self.Qbar_ + self.Qbar_.T)
+
+        x0 = np.array([0.02, 0.95], dtype=float)
         bounds = [(1e-6, 0.5), (1e-6, 0.999)]
         cons = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
 
@@ -364,30 +395,18 @@ class DCCGARCH:
         self.a_, self.b_ = opt.x
         self.loglik_ = -self._negative_loglik(opt.x, Evals, self.Qbar_)
 
-        _, R_t = self._dcc_recursion(opt.x, Evals, self.Qbar_)
-        self.R_t_ = R_t
+        _, self.R_t_ = self._dcc_recursion(opt.x, Evals, self.Qbar_)
 
         T, N = Evals.shape
-        H_t = np.zeros((T, N, N))
+        H_t = np.zeros((T, N, N), dtype=float)
         for t in range(T):
             D_t = np.diag(sigmas_vals[t])
-            H_t[t] = D_t @ R_t[t] @ D_t
+            H_t[t] = D_t @ self.R_t_[t] @ D_t
 
         self.H_t_ = H_t
-
-        if idx is not None and cols is not None:
-            self.index_ = idx
-            self.columns_ = cols
-        else:
-            self.index_ = pd.RangeIndex(start=0, stop=Evals.shape[0], step=1)
-            self.columns_ = [f"Asset_{i}" for i in range(Evals.shape[1])]
-
         return self
 
     def correlation_series(self, asset_i, asset_j):
-        """
-        Return time series of dynamic correlation between two assets.
-        """
         i = self.columns_.index(asset_i) if isinstance(asset_i, str) else asset_i
         j = self.columns_.index(asset_j) if isinstance(asset_j, str) else asset_j
 
@@ -400,7 +419,6 @@ class DCCGARCH:
 
         vals = [self.H_t_[t, i, j] for t in range(len(self.index_))]
         return pd.Series(vals, index=self.index_, name=f"Cov({asset_i},{asset_j})")
-
 
 
 # 5. MULTIVARIATE DIAGNOSTICS
@@ -492,22 +510,18 @@ def multivariate_normality_test(E_df):
     return None
 
 
-
 # 6. MAIN PIPELINE
 
 def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY"):
-    
-    # Step A: Download data
 
+    # Step A: Download data
     prices = download_prices(tickers, start, end)
     returns = compute_log_returns(prices)
 
     print("\nDownloaded price data shape:", prices.shape)
     print("Return matrix shape:", returns.shape)
 
-    
     # Step B: Fit univariate GARCH
-
     uni_results = {}
     diag_rows = []
 
@@ -554,9 +568,7 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
         returns_aligned[example_asset].dropna()
     )
 
-
     # Step C: Variance comparison with RV and VIX
-
     print("\n=== Conditional variance vs realized variance proxy vs VIX ===")
 
     rv_proxy = realized_variance_proxy(returns_aligned, window=21)
@@ -580,8 +592,6 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
             axis=1
         ).dropna()
 
-        # scale VIX to daily variance proxy:
-        # annualized vol -> daily variance approx (VIX/100)^2 / 252
         compare_df["vix_var_proxy"] = (compare_df["VIX"] / 100.0) ** 2 / 252.0
 
         print(compare_df[["cond_var", "rv_proxy", "vix_var_proxy"]].corr().round(4))
@@ -594,16 +604,10 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
         plt.legend()
         plt.tight_layout()
         plt.show()
-
     else:
         print(f"{market_proxy} not in selected tickers. Skipping VIX comparison.")
 
-    
     # Step D: Build DCC input
-    dcc_df = pd.concat([std_resid_df, sigma_df], axis=1).dropna()
-    std_cols = returns_aligned.columns.tolist()
-    sig_cols = returns_aligned.columns.tolist()
-
     E_df = std_resid_df.dropna()
     sigma_df_clean = sigma_df.loc[E_df.index].dropna()
 
@@ -613,9 +617,7 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
 
     print("\nDCC input shape:", E_df.shape)
 
-
     # Step E: Fit DCC
-
     print("\n=== Fitting DCC(1,1) ===")
     dcc = DCCGARCH().fit(E_df, sigma_df_clean)
     print(f"DCC parameters: a={dcc.a_:.6f}, b={dcc.b_:.6f}")
@@ -630,7 +632,6 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
         plt.title(f"Dynamic Correlation: {a1} vs {a2}")
         plt.tight_layout()
         plt.show()
-
 
     # Step F: Multivariate diagnostics
     print("\n=== Multivariate diagnostics ===")
@@ -653,8 +654,6 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
         print("\nInstall 'pingouin' for a multivariate normality test:")
         print("pip install pingouin")
 
-
-    # Return everything
     return {
         "prices": prices,
         "returns": returns_aligned,
@@ -670,7 +669,6 @@ def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY")
         "componentwise_ljungbox": comp_lb,
         "cross_product_portmanteau": cross_lb
     }
-
 
 
 # 7. RUN
