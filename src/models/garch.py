@@ -5,10 +5,12 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import time
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+import requests
 
 from scipy.optimize import minimize
 from scipy.stats import jarque_bera, probplot, chi2
@@ -50,14 +52,92 @@ PLOT_DIR_PREFIX = "plots_"  # just for naming titles, no saving to disk by defau
 
 # 2. DATA HELPERS
 
+def _yf_session():
+    """
+    Return a requests.Session with browser-like headers.
+    Cloud hosting providers (Render, AWS, GCP…) are often blocked by Yahoo
+    Finance's CDN unless the request looks like it comes from a real browser.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+    })
+    return s
+
+
 def download_prices(tickers, start, end):
     """
     Download adjusted close prices from Yahoo Finance.
+
+    Uses per-ticker Ticker.history() with a browser-like session so requests
+    succeed from cloud hosting environments (Render, AWS, GCP, etc.) where
+    yf.download() batch requests are often blocked.
+
+    Falls back to yf.download() batch call if per-ticker fetch fails.
     """
-    data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
-    data = data.dropna(how="all")
+    if isinstance(tickers, str):
+        tickers = [tickers]
+
+    session = _yf_session()
+    frames  = {}
+    failed  = []
+
+    # ── per-ticker fetch (most reliable on cloud) ─────────────────────────────
+    for ticker in tickers:
+        for attempt in range(3):
+            try:
+                t    = yf.Ticker(ticker, session=session)
+                hist = t.history(start=start, end=end, auto_adjust=True)
+                if not hist.empty:
+                    close = hist["Close"].copy()
+                    # strip timezone so all indices are tz-naive
+                    if hasattr(close.index, "tz") and close.index.tz is not None:
+                        close.index = close.index.tz_localize(None)
+                    frames[ticker] = close
+                    break
+                elif attempt == 2:
+                    failed.append(ticker)
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1 + attempt)   # brief back-off
+                else:
+                    failed.append(ticker)
+
+    # ── batch fallback for any that failed above ──────────────────────────────
+    if failed:
+        try:
+            batch = yf.download(
+                failed, start=start, end=end,
+                auto_adjust=True, progress=False, threads=False,
+            )
+            if not batch.empty:
+                close_batch = batch["Close"] if "Close" in batch.columns else batch
+                if isinstance(close_batch, pd.Series):
+                    close_batch = close_batch.to_frame(name=failed[0])
+                if hasattr(close_batch.index, "tz") and close_batch.index.tz is not None:
+                    close_batch.index = close_batch.index.tz_localize(None)
+                for col in close_batch.columns:
+                    frames[col] = close_batch[col]
+        except Exception:
+            pass   # will surface as empty df below
+
+    if not frames:
+        raise RuntimeError(
+            f"download_prices: could not fetch any data for {tickers} "
+            f"({start} → {end}).  "
+            "Check ticker symbols, date range, and network access."
+        )
+
+    data = pd.DataFrame(frames)
+    data = data.sort_index().dropna(how="all")
     return data
 
 

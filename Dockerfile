@@ -19,7 +19,7 @@ EXPOSE 8050
 
 # Render injects $PORT at runtime; fall back to 8050 locally
 CMD gunicorn --bind "0.0.0.0:${PORT:-8050}" \
-             --timeout 300 \
+             --timeout 600 \
              --workers 1 \
              --log-level info \
              main:server

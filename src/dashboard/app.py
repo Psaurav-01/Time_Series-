@@ -26,9 +26,8 @@ from scipy.stats import chi2, probplot, jarque_bera
 
 import traceback
 
-import diskcache
 import dash
-from dash import dcc, html, Input, Output, State, dash_table, DiskcacheManager
+from dash import dcc, html, Input, Output, State, dash_table
 import dash_bootstrap_components as dbc
 
 # ── Ensure project root is on sys.path so src.models.garch is importable ────
@@ -98,16 +97,11 @@ def _json_to_df(s: str | None) -> pd.DataFrame | None:
 # App initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Background callbacks: store job state in /tmp so it works in Docker / Render
-_cache = diskcache.Cache("/tmp/garch_dash_cache")
-_bg_manager = DiskcacheManager(_cache)
-
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.FLATLY],
     suppress_callback_exceptions=True,
     title="GARCH / DCC Dashboard",
-    background_callback_manager=_bg_manager,
 )
 server = app.server  # exposed for Gunicorn: `gunicorn main:server`
 
@@ -219,74 +213,60 @@ app.layout = dbc.Container([
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Callback: Run Model  (background=True bypasses Render's HTTP timeout)
+# Callback: Run Model
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EMPTY_13 = (None,) * 12 + (None,)  # 12 stores + run-status  (error path)
+_NO_DATA = (None,) * 12   # 12 dcc.Store outputs (error path)
 
 
 @app.callback(
-    output=[
-        Output("store-returns",    "data"),
-        Output("store-sigma",      "data"),
-        Output("store-std-resid",  "data"),
-        Output("store-uni-diag",   "data"),
-        Output("store-dcc-params", "data"),
-        Output("store-dcc-corr",   "data"),
-        Output("store-dcc-latest", "data"),
-        Output("store-rv",         "data"),
-        Output("store-vix",        "data"),
-        Output("store-comp-lb",    "data"),
-        Output("store-cross-lb",   "data"),
-        Output("store-tickers",    "data"),
-        Output("run-status",       "children"),
-        Output("store-error",      "data"),
-    ],
-    inputs=[Input("run-btn", "n_clicks")],
-    state=[
-        State("universe-select", "value"),
-        State("start-date",      "value"),
-        State("end-date",        "value"),
-        State("dist-select",     "value"),
-        State("lags-input",      "value"),
-    ],
-    background=True,
-    running=[
-        (Output("run-btn", "disabled"), True,           False),
-        (Output("run-btn", "children"), "⏳ Computing…", "▶  Run Model"),
-    ],
+    Output("store-returns",    "data"),
+    Output("store-sigma",      "data"),
+    Output("store-std-resid",  "data"),
+    Output("store-uni-diag",   "data"),
+    Output("store-dcc-params", "data"),
+    Output("store-dcc-corr",   "data"),
+    Output("store-dcc-latest", "data"),
+    Output("store-rv",         "data"),
+    Output("store-vix",        "data"),
+    Output("store-comp-lb",    "data"),
+    Output("store-cross-lb",   "data"),
+    Output("store-tickers",    "data"),
+    Output("run-status",       "children"),
+    Output("store-error",      "data"),
+    Input("run-btn",           "n_clicks"),
+    State("universe-select",   "value"),
+    State("start-date",        "value"),
+    State("end-date",          "value"),
+    State("dist-select",       "value"),
+    State("lags-input",        "value"),
     prevent_initial_call=True,
 )
 def run_model(n_clicks, universe, start, end, dist, lags):
-    """Fit GARCH(1,1) per asset then DCC(1,1). Runs in background thread."""
-    if not n_clicks:
-        raise dash.exceptions.PreventUpdate
-
-    _no_data = (None,) * 12  # 12 store outputs
-
+    """Download data, fit GARCH(1,1) per asset, then DCC(1,1)."""
     try:
         tickers = UNIVERSES[universe]
         lags    = int(lags) if lags else 20
 
         # ── Step A: data ──────────────────────────────────────────────────────
-        prices  = download_prices(tickers, start, end)
+        prices = download_prices(tickers, start, end)
         if prices is None or prices.empty:
             raise ValueError(
-                f"yfinance returned no price data for {tickers} "
-                f"({start} → {end}). Check tickers and date range."
+                f"No price data returned for {tickers} ({start} → {end}). "
+                "Check tickers and date range."
             )
-        returns = compute_log_returns(prices)
 
-        # Align all assets to common dates
-        common = returns.index.copy()
+        returns = compute_log_returns(prices)
+        # keep only rows where ALL assets have data
+        common  = returns.index.copy()
         for c in returns.columns:
             common = common.intersection(returns[c].dropna().index)
         returns = returns.loc[common]
 
         if len(returns) < 100:
             raise ValueError(
-                f"Only {len(returns)} common observations found — need at least 100. "
-                "Try a wider date range."
+                f"Only {len(returns)} common observations — need ≥ 100. "
+                "Widen the date range."
             )
 
         # ── Step B: univariate GARCH ──────────────────────────────────────────
@@ -295,23 +275,22 @@ def run_model(n_clicks, universe, start, end, dist, lags):
         diag_rows = []
 
         for col in returns.columns:
-            series = returns[col].dropna()
-            fit    = fit_univariate_garch(series, dist=dist)
-
+            series      = returns[col].dropna()
+            fit         = fit_univariate_garch(series, dist=dist)
             cond_vol_s  = pd.Series(fit["conditional_vol"], index=series.index)
             std_resid_s = fit["std_resid"]
 
             sigma_df[col] = cond_vol_s.reindex(returns.index)
             z_df[col]     = std_resid_s.reindex(returns.index)
 
-            d = univariate_diagnostics(col, std_resid_s, lags=lags)
-            d["aic"]    = fit["aic"]
-            d["bic"]    = fit["bic"]
-            d["loglik"] = fit["loglik"]
-            p           = fit["params"]
-            d["omega"]  = float(p.get("omega",    np.nan))
-            d["alpha"]  = float(p.get("alpha[1]", np.nan))
-            d["beta"]   = float(p.get("beta[1]",  np.nan))
+            d            = univariate_diagnostics(col, std_resid_s, lags=lags)
+            d["aic"]     = fit["aic"]
+            d["bic"]     = fit["bic"]
+            d["loglik"]  = fit["loglik"]
+            p            = fit["params"]
+            d["omega"]   = float(p.get("omega",    np.nan))
+            d["alpha"]   = float(p.get("alpha[1]", np.nan))
+            d["beta"]    = float(p.get("beta[1]",  np.nan))
             diag_rows.append(d)
 
         uni_diag = pd.DataFrame(diag_rows).set_index("asset")
@@ -320,23 +299,20 @@ def run_model(n_clicks, universe, start, end, dist, lags):
         E_df       = z_df.dropna()
         sig_cl     = sigma_df.loc[E_df.index].dropna()
         common_dcc = E_df.index.intersection(sig_cl.index)
-        E_df       = E_df.loc[common_dcc]
-        sig_cl     = sig_cl.loc[common_dcc]
+        E_df, sig_cl = E_df.loc[common_dcc], sig_cl.loc[common_dcc]
 
-        dcc_model  = DCCGARCH().fit(E_df, sig_cl)
-
+        dcc_model     = DCCGARCH().fit(E_df, sig_cl)
         cols          = list(returns.columns)
-        dcc_corr_dict = {}
-        for i in range(len(cols)):
-            for j in range(i + 1, len(cols)):
-                dcc_corr_dict[f"{cols[i]}|{cols[j]}"] = dcc_model.R_t_[:, i, j].tolist()
-
+        dcc_corr_dict = {
+            f"{cols[i]}|{cols[j]}": dcc_model.R_t_[:, i, j].tolist()
+            for i in range(len(cols))
+            for j in range(i + 1, len(cols))
+        }
         latest_matrix = dcc_model.R_t_[-1].tolist()
         dcc_dates     = [str(d) for d in E_df.index]
 
         # ── Step D: realized variance + VIX ──────────────────────────────────
         rv_proxy = realized_variance_proxy(returns, window=21)
-
         vix_json = None
         try:
             vix_prices = download_prices([VIX_TICKER], start, end)
@@ -346,7 +322,7 @@ def run_model(n_clicks, universe, start, end, dist, lags):
                 "values": vix_s.tolist(),
             })
         except Exception:
-            pass  # VIX is optional
+            pass  # VIX is optional — skip silently
 
         # ── Step E: multivariate diagnostics ─────────────────────────────────
         comp_lb  = componentwise_ljungbox(E_df, lags=lags)
@@ -375,12 +351,12 @@ def run_model(n_clicks, universe, start, end, dist, lags):
         )
 
     except Exception as exc:
-        err_detail = traceback.format_exc()
-        err_msg    = f"{type(exc).__name__}: {exc}"
+        err_tb  = traceback.format_exc()
+        err_msg = f"{type(exc).__name__}: {exc}"
         return (
-            *_no_data,
-            "❌ Model fitting failed — see error below.",
-            json.dumps({"msg": err_msg, "detail": err_detail}),
+            *_NO_DATA,
+            "❌ Failed — see error card below",
+            json.dumps({"msg": err_msg, "detail": err_tb}),
         )
 
 
