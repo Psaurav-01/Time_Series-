@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: garch-dashboard
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    # Render sets PORT automatically; Dockerfile reads it via ${PORT:-8050}
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"

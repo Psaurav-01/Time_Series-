@@ -1,297 +1,606 @@
-"""
-GARCH Model Module for S&P 500 Volatility Forecasting
-Implements GARCH(1,1) model for conditional volatility estimation
-"""
+
+# PROJECT: Univariate GARCH(1,1) + DCC-GARCH(1,1)
+
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+from scipy.optimize import minimize
+from scipy.stats import jarque_bera, probplot, chi2
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
 from arch import arch_model
-import warnings
-warnings.filterwarnings('ignore')
+
+# Optional multivariate normality test
+try:
+    import pingouin as pg
+    HAS_PINGOUIN = True
+except ImportError:
+    HAS_PINGOUIN = False
 
 
-class SP500GARCHModel:
-    """GARCH(1,1) model for S&P 500 volatility forecasting"""
-    
-    def __init__(self, returns):
+
+# 1. CONFIG
+
+START_DATE = "2016-01-01"
+END_DATE   = "2026-01-01"
+
+# Choose ONE universe to start.
+# Example 1: SPY + bonds
+# TICKERS = ["SPY", "TLT"]
+
+# Example 2: SPY + Gold + Bitcoin
+# TICKERS = ["SPY", "GLD", "BTC-USD"]
+
+# Example 3: 11 S&P sectors
+TICKERS = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY", "XLRE", "XLC"]
+
+MARKET_PROXY = "SPY"      # used for VIX comparison if available
+VIX_TICKER = "^VIX"
+LAGS = 20
+DIST = "normal"           # "normal" or "t" for univariate GARCH
+PLOT_DIR_PREFIX = "plots_"  # just for naming titles, no saving to disk by default
+
+
+
+# 2. DATA HELPERS
+
+def download_prices(tickers, start, end):
+    """
+    Download adjusted close prices from Yahoo Finance.
+    """
+    data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+    data = data.dropna(how="all")
+    return data
+
+
+def compute_log_returns(prices):
+    """
+    Compute daily log returns.
+    """
+    rets = np.log(prices / prices.shift(1)).dropna()
+    return rets
+
+
+def realized_variance_proxy(returns, window=21):
+    """
+    Simple realized variance proxy using rolling sum of squared daily returns.
+    For true RV you would use intraday returns.
+    """
+    return returns.pow(2).rolling(window).sum()
+
+
+
+# 3. UNIVARIATE GARCH
+
+def fit_univariate_garch(series, dist="normal"):
+    """
+    Fit GARCH(1,1) with constant mean.
+    Uses returns in percentage terms for arch package stability.
+    """
+    y = 100 * series.dropna()
+
+    if dist.lower() == "normal":
+        am = arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist="normal")
+    elif dist.lower() == "t":
+        am = arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist="t")
+    else:
+        raise ValueError("dist must be 'normal' or 't'")
+
+    res = am.fit(disp="off")
+
+    out = {
+        "model": am,
+        "result": res,
+        "aic": res.aic,
+        "bic": res.bic,
+        "loglik": res.loglikelihood,
+        "params": res.params,
+        "conditional_vol": res.conditional_volatility / 100.0,  # back to decimal-return scale
+        "resid": res.resid / 100.0,
+        "std_resid": pd.Series(res.std_resid, index=series.dropna().index).replace([np.inf, -np.inf], np.nan).dropna()
+    }
+    return out
+
+
+def univariate_diagnostics(name, std_resid, lags=20, qq_dist="norm"):
+    """
+    Return Ljung-Box tests and Jarque-Bera on standardized residuals.
+    """
+    z = std_resid.dropna()
+    lb_z = acorr_ljungbox(z, lags=[lags], return_df=True)
+    lb_z2 = acorr_ljungbox(z**2, lags=[lags], return_df=True)
+    jb_stat, jb_p = jarque_bera(z)
+
+    diag = {
+        "asset": name,
+        "lb_resid_stat": lb_z["lb_stat"].iloc[0],
+        "lb_resid_pvalue": lb_z["lb_pvalue"].iloc[0],
+        "lb_sqresid_stat": lb_z2["lb_stat"].iloc[0],
+        "lb_sqresid_pvalue": lb_z2["lb_pvalue"].iloc[0],
+        "jb_stat": jb_stat,
+        "jb_pvalue": jb_p
+    }
+    return diag
+
+
+def plot_univariate_diagnostics(name, std_resid, cond_var, actual_returns):
+    """
+    Plot:
+    1) standardized residuals
+    2) Q-Q plot
+    3) conditional variance vs squared returns
+    """
+    z = std_resid.dropna()
+    idx = z.index
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(idx, z)
+    plt.axhline(0, linestyle="--")
+    plt.title(f"{name} - Standardized Residuals")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(6, 6))
+    probplot(z, dist="norm", plot=plt)
+    plt.title(f"{name} - Q-Q Plot (Normal)")
+    plt.tight_layout()
+    plt.show()
+
+    cond_var = pd.Series(cond_var**2, index=actual_returns.dropna().index).dropna()
+    sq_ret = actual_returns.loc[cond_var.index] ** 2
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(cond_var.index, cond_var, label="Conditional Variance")
+    plt.plot(sq_ret.index, sq_ret, label="Squared Returns", alpha=0.6)
+    plt.title(f"{name} - Conditional Variance vs Squared Returns")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+
+# 4. DCC-GARCH
+
+class DCCGARCH:
+    """
+    Two-step DCC(1,1) estimation.
+    Step 1: use standardized residuals from univariate GARCHs
+    Step 2: estimate DCC parameters (a, b) by maximizing DCC log-likelihood
+
+    References/assumptions:
+    - Q_t = (1-a-b)Qbar + a * e_{t-1}e_{t-1}' + b * Q_{t-1}
+    - R_t = diag(Q_t)^(-1/2) Q_t diag(Q_t)^(-1/2)
+
+    Inputs:
+    E: T x N matrix of standardized residuals
+    sigmas: T x N matrix of conditional std devs (decimal return scale)
+    """
+
+    def __init__(self):
+        self.a_ = None
+        self.b_ = None
+        self.Qbar_ = None
+        self.R_t_ = None
+        self.H_t_ = None
+        self.E_ = None
+        self.sigmas_ = None
+        self.loglik_ = None
+
+    @staticmethod
+    def _dcc_recursion(params, E, Qbar):
+        a, b = params
+        T, N = E.shape
+
+        Q_t = np.zeros((T, N, N))
+        R_t = np.zeros((T, N, N))
+
+        Q_t[0] = Qbar.copy()
+
+        for t in range(T):
+            if t > 0:
+                et_1 = E[t - 1].reshape(-1, 1)
+                Q_t[t] = (1 - a - b) * Qbar + a * (et_1 @ et_1.T) + b * Q_t[t - 1]
+
+            q_diag = np.sqrt(np.diag(Q_t[t]))
+            inv_q_diag = np.diag(1.0 / q_diag)
+            R_t[t] = inv_q_diag @ Q_t[t] @ inv_q_diag
+
+        return Q_t, R_t
+
+    @staticmethod
+    def _negative_loglik(params, E, Qbar):
+        a, b = params
+
+        # constraints
+        if a < 0 or b < 0 or (a + b) >= 0.999:
+            return 1e12
+
+        T, N = E.shape
+        _, R_t = DCCGARCH._dcc_recursion(params, E, Qbar)
+
+        nll = 0.0
+        for t in range(T):
+            Rt = R_t[t]
+            et = E[t].reshape(-1, 1)
+
+            try:
+                sign, logdet = np.linalg.slogdet(Rt)
+                if sign <= 0:
+                    return 1e12
+                invRt = np.linalg.inv(Rt)
+            except np.linalg.LinAlgError:
+                return 1e12
+
+            term = logdet + float(et.T @ invRt @ et)
+            nll += term
+
+        # ignore constants
+        return 0.5 * nll
+
+    def fit(self, E, sigmas):
         """
-        Initialize GARCH model with return data
-        
-        Parameters:
-        -----------
-        returns : pd.Series
-            Time series of returns (in percentage)
+        E: DataFrame or array, standardized residuals, shape (T, N)
+        sigmas: DataFrame or array, conditional std devs, shape (T, N)
         """
-        self.returns = returns
-        self.model = None
-        self.fitted_model = None
-        self.forecast = None
-        
-    def fit(self, p=1, q=1, mean='Zero', vol='GARCH', dist='normal'):
-        """
-        Fit GARCH model to returns
-        
-        Parameters:
-        -----------
-        p : int
-            GARCH lag order (default 1)
-        q : int
-            ARCH lag order (default 1)
-        mean : str
-            Mean model specification ('Zero', 'Constant', 'AR')
-        vol : str
-            Volatility model ('GARCH', 'EGARCH', 'FIGARCH')
-        dist : str
-            Error distribution ('normal', 't', 'skewt')
-        
-        Returns:
-        --------
-        self : fitted model
-        """
-        print(f"\n{'='*60}")
-        print(f"Fitting GARCH({p},{q}) Model to S&P 500 Returns")
-        print(f"{'='*60}")
-        print(f"Sample size: {len(self.returns)} observations")
-        print(f"Mean model: {mean}")
-        print(f"Volatility model: {vol}")
-        print(f"Distribution: {dist}")
-        
-        # Create GARCH model
-        self.model = arch_model(
-            self.returns,
-            mean=mean,
-            vol=vol,
-            p=p,
-            q=q,
-            dist=dist
+        if isinstance(E, pd.DataFrame):
+            idx = E.index
+            cols = E.columns
+            Evals = E.values
+        else:
+            idx = None
+            cols = None
+            Evals = np.asarray(E)
+
+        sigmas_vals = sigmas.values if isinstance(sigmas, pd.DataFrame) else np.asarray(sigmas)
+
+        self.E_ = Evals
+        self.sigmas_ = sigmas_vals
+        self.Qbar_ = np.cov(Evals.T)
+
+        x0 = np.array([0.02, 0.95])
+        bounds = [(1e-6, 0.5), (1e-6, 0.999)]
+        cons = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
+
+        opt = minimize(
+            self._negative_loglik,
+            x0=x0,
+            args=(Evals, self.Qbar_),
+            method="SLSQP",
+            bounds=bounds,
+            constraints=cons
         )
-        
-        # Fit the model
-        print("\nFitting model...")
-        self.fitted_model = self.model.fit(disp='off')
-        
-        print("[SUCCESS] Model fitted successfully!")
-        
+
+        if not opt.success:
+            raise RuntimeError(f"DCC optimization failed: {opt.message}")
+
+        self.a_, self.b_ = opt.x
+        self.loglik_ = -self._negative_loglik(opt.x, Evals, self.Qbar_)
+
+        _, R_t = self._dcc_recursion(opt.x, Evals, self.Qbar_)
+        self.R_t_ = R_t
+
+        T, N = Evals.shape
+        H_t = np.zeros((T, N, N))
+        for t in range(T):
+            D_t = np.diag(sigmas_vals[t])
+            H_t[t] = D_t @ R_t[t] @ D_t
+
+        self.H_t_ = H_t
+
+        if idx is not None and cols is not None:
+            self.index_ = idx
+            self.columns_ = cols
+        else:
+            self.index_ = pd.RangeIndex(start=0, stop=Evals.shape[0], step=1)
+            self.columns_ = [f"Asset_{i}" for i in range(Evals.shape[1])]
+
         return self
-    
-    def summary(self):
-        """Display model summary statistics"""
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        print("\n" + "="*60)
-        print("GARCH Model Summary")
-        print("="*60)
-        print(self.fitted_model.summary())
-        
-        return self.fitted_model.summary()
-    
-    def get_parameters(self):
+
+    def correlation_series(self, asset_i, asset_j):
         """
-        Get fitted GARCH parameters
-        
-        Returns:
-        --------
-        dict : Model parameters
+        Return time series of dynamic correlation between two assets.
         """
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        params = self.fitted_model.params
-        
-        param_dict = {
-            'omega': params.get('omega', None),
-            'alpha[1]': params.get('alpha[1]', None),
-            'beta[1]': params.get('beta[1]', None)
-        }
-        
-        print("\n" + "="*60)
-        print("GARCH Model Parameters")
-        print("="*60)
-        for key, value in param_dict.items():
-            if value is not None:
-                print(f"{key:15s} = {value:.6f}")
-        
-        # Persistence
-        if param_dict['alpha[1]'] and param_dict['beta[1]']:
-            persistence = param_dict['alpha[1]'] + param_dict['beta[1]']
-            print(f"\nPersistence (α + β) = {persistence:.6f}")
-            
-            if persistence < 1:
-                print("[INFO] Model is stationary (persistence < 1)")
-            else:
-                print("[WARNING] Model may not be stationary (persistence >= 1)")
-        
-        return param_dict
-    
-    def get_conditional_volatility(self):
-        """
-        Extract conditional volatility from fitted model
-        
-        Returns:
-        --------
-        pd.Series : Conditional volatility (annualized %)
-        """
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        # Get conditional volatility
-        cond_vol = self.fitted_model.conditional_volatility
-        
-        print(f"\n[SUCCESS] Extracted conditional volatility")
-        print(f"  Mean volatility: {cond_vol.mean():.4f}%")
-        print(f"  Min volatility: {cond_vol.min():.4f}%")
-        print(f"  Max volatility: {cond_vol.max():.4f}%")
-        print(f"  Current volatility: {cond_vol.iloc[-1]:.4f}%")
-        
-        return cond_vol
-    
-    def forecast_volatility(self, horizon=5):
-        """
-        Forecast future volatility
-        
-        Parameters:
-        -----------
-        horizon : int
-            Number of periods ahead to forecast
-        
-        Returns:
-        --------
-        pd.DataFrame : Volatility forecasts
-        """
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        print(f"\n{'='*60}")
-        print(f"Forecasting Volatility for Next {horizon} Days")
-        print(f"{'='*60}")
-        
-        # Generate forecast
-        self.forecast = self.fitted_model.forecast(horizon=horizon)
-        
-        # Extract variance forecast and convert to volatility (std dev)
-        variance_forecast = self.forecast.variance.values[-1, :]
-        volatility_forecast = np.sqrt(variance_forecast)
-        
-        # Create forecast dataframe
-        forecast_df = pd.DataFrame({
-            'Day': range(1, horizon + 1),
-            'Forecasted_Volatility_%': volatility_forecast
+        i = self.columns_.index(asset_i) if isinstance(asset_i, str) else asset_i
+        j = self.columns_.index(asset_j) if isinstance(asset_j, str) else asset_j
+
+        vals = [self.R_t_[t, i, j] for t in range(len(self.index_))]
+        return pd.Series(vals, index=self.index_, name=f"Corr({asset_i},{asset_j})")
+
+    def covariance_series(self, asset_i, asset_j):
+        i = self.columns_.index(asset_i) if isinstance(asset_i, str) else asset_i
+        j = self.columns_.index(asset_j) if isinstance(asset_j, str) else asset_j
+
+        vals = [self.H_t_[t, i, j] for t in range(len(self.index_))]
+        return pd.Series(vals, index=self.index_, name=f"Cov({asset_i},{asset_j})")
+
+
+
+# 5. MULTIVARIATE DIAGNOSTICS
+
+def componentwise_ljungbox(E_df, lags=20):
+    """
+    Run Ljung-Box on each dimension's standardized residuals and squared residuals.
+    """
+    rows = []
+    for col in E_df.columns:
+        z = E_df[col].dropna()
+        lb1 = acorr_ljungbox(z, lags=[lags], return_df=True)
+        lb2 = acorr_ljungbox(z**2, lags=[lags], return_df=True)
+        rows.append({
+            "asset": col,
+            "lb_resid_stat": lb1["lb_stat"].iloc[0],
+            "lb_resid_pvalue": lb1["lb_pvalue"].iloc[0],
+            "lb_sqresid_stat": lb2["lb_stat"].iloc[0],
+            "lb_sqresid_pvalue": lb2["lb_pvalue"].iloc[0]
         })
-        
-        print("\nVolatility Forecasts:")
-        print(forecast_df.to_string(index=False))
-        
-        print(f"\nAverage forecasted volatility: {volatility_forecast.mean():.4f}%")
-        
-        return forecast_df
-    
-    def calculate_var(self, confidence_level=0.95):
-        """
-        Calculate Value at Risk (VaR)
-        
-        Parameters:
-        -----------
-        confidence_level : float
-            Confidence level (default 0.95 for 95% VaR)
-        
-        Returns:
-        --------
-        dict : VaR metrics
-        """
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        # Get current conditional volatility
-        current_vol = self.fitted_model.conditional_volatility.iloc[-1]
-        
-        # Calculate VaR (assuming normal distribution)
-        from scipy import stats
-        z_score = stats.norm.ppf(1 - confidence_level)
-        var = z_score * current_vol
-        
-        var_metrics = {
-            'confidence_level': confidence_level,
-            'current_volatility_%': current_vol,
-            'VaR_%': var,
-            'interpretation': f"{confidence_level*100:.0f}% confidence that loss will not exceed {abs(var):.2f}%"
-        }
-        
-        print(f"\n{'='*60}")
-        print(f"Value at Risk (VaR) - {confidence_level*100:.0f}% Confidence Level")
-        print(f"{'='*60}")
-        print(f"Current Volatility: {current_vol:.4f}%")
-        print(f"VaR: {var:.4f}%")
-        print(f"\n{var_metrics['interpretation']}")
-        
-        return var_metrics
-    
-    def model_diagnostics(self):
-        """
-        Perform model diagnostics
-        
-        Returns:
-        --------
-        dict : Diagnostic statistics
-        """
-        if self.fitted_model is None:
-            raise ValueError("Model not fitted yet! Call fit() first.")
-        
-        # Get standardized residuals
-        std_resid = self.fitted_model.std_resid
-        
-        # Calculate diagnostics
-        diagnostics = {
-            'AIC': self.fitted_model.aic,
-            'BIC': self.fitted_model.bic,
-            'Log-Likelihood': self.fitted_model.loglikelihood,
-            'Num_Observations': self.fitted_model.nobs,
-            'Mean_Std_Residuals': std_resid.mean(),
-            'Std_Std_Residuals': std_resid.std()
-        }
-        
-        print(f"\n{'='*60}")
-        print(f"Model Diagnostics")
-        print(f"{'='*60}")
-        for key, value in diagnostics.items():
-            print(f"{key:25s} = {value:.4f}")
-        
-        return diagnostics
+    return pd.DataFrame(rows)
 
 
-# Test function
+def cross_product_portmanteau(E_df, lags=10):
+    """
+    Simple multivariate diagnostic:
+    construct vectorized centered cross-products e_i e_j and run Ljung-Box on each.
+    """
+    E = E_df.copy()
+    cols = E.columns
+    out = []
+
+    for i in range(len(cols)):
+        for j in range(i, len(cols)):
+            s = (E.iloc[:, i] * E.iloc[:, j]).dropna()
+            s = s - s.mean()
+            lb = acorr_ljungbox(s, lags=[lags], return_df=True)
+            out.append({
+                "pair": f"{cols[i]} x {cols[j]}",
+                "lb_stat": lb["lb_stat"].iloc[0],
+                "lb_pvalue": lb["lb_pvalue"].iloc[0]
+            })
+    return pd.DataFrame(out)
+
+
+def mahalanobis_distances(E_df):
+    """
+    Mahalanobis distances of standardized residual vectors.
+    Under multivariate normality, squared Mahalanobis distances ~ Chi-square(df=N)
+    """
+    X = E_df.dropna().values
+    mu = X.mean(axis=0)
+    S = np.cov(X.T)
+    S_inv = np.linalg.inv(S)
+
+    d2 = []
+    for x in X:
+        dx = x - mu
+        d2.append(dx.T @ S_inv @ dx)
+    d2 = np.array(d2)
+    return pd.Series(d2, index=E_df.dropna().index)
+
+
+def plot_mahalanobis_qq(E_df):
+    d2 = mahalanobis_distances(E_df)
+    n = len(d2)
+    p = E_df.shape[1]
+    theo = chi2.ppf((np.arange(1, n + 1) - 0.5) / n, df=p)
+    sample = np.sort(d2.values)
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(theo, sample, s=10)
+    mn = min(theo.min(), sample.min())
+    mx = max(theo.max(), sample.max())
+    plt.plot([mn, mx], [mn, mx], linestyle="--")
+    plt.title("Mahalanobis Distance Q-Q Plot")
+    plt.xlabel(f"Theoretical Chi-square Quantiles (df={p})")
+    plt.ylabel("Empirical Squared Mahalanobis Distances")
+    plt.tight_layout()
+    plt.show()
+
+
+def multivariate_normality_test(E_df):
+    """
+    Henze-Zirkler test if pingouin is available.
+    """
+    if HAS_PINGOUIN:
+        return pg.multivariate_normality(E_df.dropna(), alpha=0.05)
+    return None
+
+
+
+# 6. MAIN PIPELINE
+
+def run_project(tickers, start, end, dist="normal", lags=20, market_proxy="SPY"):
+    
+    # Step A: Download data
+
+    prices = download_prices(tickers, start, end)
+    returns = compute_log_returns(prices)
+
+    print("\nDownloaded price data shape:", prices.shape)
+    print("Return matrix shape:", returns.shape)
+
+    
+    # Step B: Fit univariate GARCH
+
+    uni_results = {}
+    diag_rows = []
+
+    common_index = returns.index.copy()
+    for c in returns.columns:
+        common_index = common_index.intersection(returns[c].dropna().index)
+
+    returns_aligned = returns.loc[common_index].copy()
+
+    sigma_df = pd.DataFrame(index=returns_aligned.index, columns=returns_aligned.columns, dtype=float)
+    resid_df = pd.DataFrame(index=returns_aligned.index, columns=returns_aligned.columns, dtype=float)
+    std_resid_df = pd.DataFrame(index=returns_aligned.index, columns=returns_aligned.columns, dtype=float)
+
+    print("\n=== Univariate GARCH fits ===")
+    for col in returns_aligned.columns:
+        fit = fit_univariate_garch(returns_aligned[col], dist=dist)
+        uni_results[col] = fit
+
+        sigma_series = pd.Series(fit["conditional_vol"], index=returns_aligned.index)
+        resid_series = pd.Series(fit["resid"], index=returns_aligned.index)
+        z_series = pd.Series(fit["std_resid"], index=returns_aligned.index)
+
+        sigma_df[col] = sigma_series
+        resid_df[col] = resid_series
+        std_resid_df[col] = z_series
+
+        diag = univariate_diagnostics(col, z_series, lags=lags)
+        diag["aic"] = fit["aic"]
+        diag["bic"] = fit["bic"]
+        diag_rows.append(diag)
+
+        print(f"{col}: AIC={fit['aic']:.3f}, BIC={fit['bic']:.3f}, LL={fit['loglik']:.3f}")
+
+    univariate_diag_table = pd.DataFrame(diag_rows).set_index("asset")
+    print("\n=== Univariate diagnostics ===")
+    print(univariate_diag_table.round(4))
+
+    # Plot one asset example
+    example_asset = returns_aligned.columns[0]
+    plot_univariate_diagnostics(
+        example_asset,
+        std_resid_df[example_asset].dropna(),
+        sigma_df[example_asset].dropna(),
+        returns_aligned[example_asset].dropna()
+    )
+
+
+    # Step C: Variance comparison with RV and VIX
+
+    print("\n=== Conditional variance vs realized variance proxy vs VIX ===")
+
+    rv_proxy = realized_variance_proxy(returns_aligned, window=21)
+
+    if market_proxy in returns_aligned.columns:
+        market_cond_var = sigma_df[market_proxy] ** 2
+        market_rv = rv_proxy[market_proxy]
+
+        vix = download_prices([VIX_TICKER], start, end)
+        if VIX_TICKER in vix.columns:
+            vix_series = vix[VIX_TICKER].dropna()
+        else:
+            vix_series = vix.squeeze().dropna()
+
+        compare_df = pd.concat(
+            [
+                market_cond_var.rename("cond_var"),
+                market_rv.rename("rv_proxy"),
+                vix_series.rename("VIX")
+            ],
+            axis=1
+        ).dropna()
+
+        # scale VIX to daily variance proxy:
+        # annualized vol -> daily variance approx (VIX/100)^2 / 252
+        compare_df["vix_var_proxy"] = (compare_df["VIX"] / 100.0) ** 2 / 252.0
+
+        print(compare_df[["cond_var", "rv_proxy", "vix_var_proxy"]].corr().round(4))
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(compare_df.index, compare_df["cond_var"], label="Conditional Variance")
+        plt.plot(compare_df.index, compare_df["rv_proxy"], label="Realized Variance Proxy", alpha=0.8)
+        plt.plot(compare_df.index, compare_df["vix_var_proxy"], label="VIX Variance Proxy", alpha=0.8)
+        plt.title(f"{market_proxy} - Conditional Variance vs RV Proxy vs VIX Proxy")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        print(f"{market_proxy} not in selected tickers. Skipping VIX comparison.")
+
+    
+    # Step D: Build DCC input
+    dcc_df = pd.concat([std_resid_df, sigma_df], axis=1).dropna()
+    std_cols = returns_aligned.columns.tolist()
+    sig_cols = returns_aligned.columns.tolist()
+
+    E_df = std_resid_df.dropna()
+    sigma_df_clean = sigma_df.loc[E_df.index].dropna()
+
+    common_idx = E_df.index.intersection(sigma_df_clean.index)
+    E_df = E_df.loc[common_idx]
+    sigma_df_clean = sigma_df_clean.loc[common_idx]
+
+    print("\nDCC input shape:", E_df.shape)
+
+
+    # Step E: Fit DCC
+
+    print("\n=== Fitting DCC(1,1) ===")
+    dcc = DCCGARCH().fit(E_df, sigma_df_clean)
+    print(f"DCC parameters: a={dcc.a_:.6f}, b={dcc.b_:.6f}")
+    print(f"DCC log-likelihood (quasi): {dcc.loglik_:.6f}")
+
+    # Plot one pair if possible
+    if len(tickers) >= 2:
+        a1, a2 = tickers[0], tickers[1]
+        corr_series = dcc.correlation_series(a1, a2)
+        plt.figure(figsize=(10, 4))
+        plt.plot(corr_series.index, corr_series)
+        plt.title(f"Dynamic Correlation: {a1} vs {a2}")
+        plt.tight_layout()
+        plt.show()
+
+
+    # Step F: Multivariate diagnostics
+    print("\n=== Multivariate diagnostics ===")
+
+    comp_lb = componentwise_ljungbox(E_df, lags=lags)
+    print("\nComponentwise Ljung-Box:")
+    print(comp_lb.round(4))
+
+    cross_lb = cross_product_portmanteau(E_df, lags=10)
+    print("\nCross-product portmanteau (first 10 rows):")
+    print(cross_lb.head(10).round(4))
+
+    plot_mahalanobis_qq(E_df)
+
+    mnorm = multivariate_normality_test(E_df)
+    if mnorm is not None:
+        print("\nHenze-Zirkler multivariate normality test:")
+        print(mnorm)
+    else:
+        print("\nInstall 'pingouin' for a multivariate normality test:")
+        print("pip install pingouin")
+
+
+    # Return everything
+    return {
+        "prices": prices,
+        "returns": returns_aligned,
+        "univariate_results": uni_results,
+        "univariate_diagnostics": univariate_diag_table,
+        "sigma": sigma_df,
+        "resid": resid_df,
+        "std_resid": std_resid_df,
+        "rv_proxy": rv_proxy,
+        "dcc": dcc,
+        "dcc_E": E_df,
+        "dcc_sigma": sigma_df_clean,
+        "componentwise_ljungbox": comp_lb,
+        "cross_product_portmanteau": cross_lb
+    }
+
+
+
+# 7. RUN
+
 if __name__ == "__main__":
-    # Import data fetcher
-    import sys
-    sys.path.append('.')
-    from src.utils.data_fetcher import SP500DataFetcher
-    
-    print("Testing GARCH Model with S&P 500 Data")
-    print("="*60)
-    
-    # Fetch data
-    fetcher = SP500DataFetcher()
-    prices, returns = fetcher.get_recent_data(days=100)
-    
-    # Initialize and fit GARCH model
-    garch = SP500GARCHModel(returns)
-    garch.fit(p=1, q=1, mean='Zero', vol='GARCH', dist='normal')
-    
-    # Display results
-    garch.get_parameters()
-    
-    # Get conditional volatility
-    cond_vol = garch.get_conditional_volatility()
-    
-    # Forecast volatility
-    forecast = garch.forecast_volatility(horizon=5)
-    
-    # Calculate VaR
-    var = garch.calculate_var(confidence_level=0.95)
-    
-    # Model diagnostics
-    diagnostics = garch.model_diagnostics()
-    
-    print("\n" + "="*60)
-    print("GARCH Model Testing Complete!")
-    print("="*60)
+    results = run_project(
+        tickers=TICKERS,
+        start=START_DATE,
+        end=END_DATE,
+        dist=DIST,
+        lags=LAGS,
+        market_proxy=MARKET_PROXY
+    )
