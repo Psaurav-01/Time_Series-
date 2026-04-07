@@ -24,8 +24,11 @@ import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import chi2, probplot, jarque_bera
 
+import traceback
+
+import diskcache
 import dash
-from dash import dcc, html, Input, Output, State, dash_table
+from dash import dcc, html, Input, Output, State, dash_table, DiskcacheManager
 import dash_bootstrap_components as dbc
 
 # ── Ensure project root is on sys.path so src.models.garch is importable ────
@@ -95,11 +98,16 @@ def _json_to_df(s: str | None) -> pd.DataFrame | None:
 # App initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Background callbacks: store job state in /tmp so it works in Docker / Render
+_cache = diskcache.Cache("/tmp/garch_dash_cache")
+_bg_manager = DiskcacheManager(_cache)
+
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.FLATLY],
     suppress_callback_exceptions=True,
     title="GARCH / DCC Dashboard",
+    background_callback_manager=_bg_manager,
 )
 server = app.server  # exposed for Gunicorn: `gunicorn main:server`
 
@@ -152,10 +160,11 @@ _sidebar = dbc.Card([
     html.Br(),
 
     dbc.Button(
-        [html.I(className="me-2"), "▶  Run Model"],
+        "▶  Run Model",
         id="run-btn", color="primary", className="w-100 fw-bold",
     ),
-    dcc.Loading(html.Div(id="run-status", className="mt-2 small text-muted")),
+    html.Div(id="run-status", className="mt-2 small text-muted"),
+    html.Div(id="run-error",  className="mt-1"),   # shows red alert on failure
 
 ], body=True, className="sticky-top", style={"top": "20px"})
 
@@ -188,10 +197,11 @@ app.layout = dbc.Container([
     dcc.Store(id="store-dcc-corr"),    # {"corr": {pair: [vals]}, "dates": [...]}
     dcc.Store(id="store-dcc-latest"),  # {"matrix": [[...]], "cols": [...]}
     dcc.Store(id="store-rv"),
-    dcc.Store(id="store-vix"),         # {"VIX": [...], "dates": [...]}
+    dcc.Store(id="store-vix"),         # {"dates": [...], "values": [...]}
     dcc.Store(id="store-comp-lb"),
     dcc.Store(id="store-cross-lb"),
     dcc.Store(id="store-tickers"),
+    dcc.Store(id="store-error"),       # holds error text if run_model fails
 
     # ── Body ──────────────────────────────────────────────────────────────────
     dbc.Row([
@@ -209,134 +219,190 @@ app.layout = dbc.Container([
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Callback: Run Model
+# Callback: Run Model  (background=True bypasses Render's HTTP timeout)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_EMPTY_13 = (None,) * 12 + (None,)  # 12 stores + run-status  (error path)
+
+
 @app.callback(
-    Output("store-returns",    "data"),
-    Output("store-sigma",      "data"),
-    Output("store-std-resid",  "data"),
-    Output("store-uni-diag",   "data"),
-    Output("store-dcc-params", "data"),
-    Output("store-dcc-corr",   "data"),
-    Output("store-dcc-latest", "data"),
-    Output("store-rv",         "data"),
-    Output("store-vix",        "data"),
-    Output("store-comp-lb",    "data"),
-    Output("store-cross-lb",   "data"),
-    Output("store-tickers",    "data"),
-    Output("run-status",       "children"),
-    Input("run-btn",           "n_clicks"),
-    State("universe-select",   "value"),
-    State("start-date",        "value"),
-    State("end-date",          "value"),
-    State("dist-select",       "value"),
-    State("lags-input",        "value"),
+    output=[
+        Output("store-returns",    "data"),
+        Output("store-sigma",      "data"),
+        Output("store-std-resid",  "data"),
+        Output("store-uni-diag",   "data"),
+        Output("store-dcc-params", "data"),
+        Output("store-dcc-corr",   "data"),
+        Output("store-dcc-latest", "data"),
+        Output("store-rv",         "data"),
+        Output("store-vix",        "data"),
+        Output("store-comp-lb",    "data"),
+        Output("store-cross-lb",   "data"),
+        Output("store-tickers",    "data"),
+        Output("run-status",       "children"),
+        Output("store-error",      "data"),
+    ],
+    inputs=[Input("run-btn", "n_clicks")],
+    state=[
+        State("universe-select", "value"),
+        State("start-date",      "value"),
+        State("end-date",        "value"),
+        State("dist-select",     "value"),
+        State("lags-input",      "value"),
+    ],
+    background=True,
+    running=[
+        (Output("run-btn", "disabled"), True,           False),
+        (Output("run-btn", "children"), "⏳ Computing…", "▶  Run Model"),
+    ],
     prevent_initial_call=True,
 )
 def run_model(n_clicks, universe, start, end, dist, lags):
+    """Fit GARCH(1,1) per asset then DCC(1,1). Runs in background thread."""
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
 
-    tickers = UNIVERSES[universe]
-    lags    = int(lags) if lags else 20
+    _no_data = (None,) * 12  # 12 store outputs
 
-    # ── Step A: data ──────────────────────────────────────────────────────────
-    prices  = download_prices(tickers, start, end)
-    returns = compute_log_returns(prices)
-
-    # Align all assets to common dates
-    common = returns.index.copy()
-    for c in returns.columns:
-        common = common.intersection(returns[c].dropna().index)
-    returns = returns.loc[common]
-
-    # ── Step B: univariate GARCH ──────────────────────────────────────────────
-    sigma_df = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
-    z_df     = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
-    diag_rows = []
-
-    for col in returns.columns:
-        series = returns[col].dropna()
-        fit    = fit_univariate_garch(series, dist=dist)
-
-        # Re-index back onto the full common index (fills NaN at any gaps)
-        cond_vol_s = pd.Series(fit["conditional_vol"], index=series.index)
-        std_resid_s = fit["std_resid"]  # already a Series with its own index
-
-        sigma_df[col] = cond_vol_s.reindex(returns.index)
-        z_df[col]     = std_resid_s.reindex(returns.index)
-
-        d = univariate_diagnostics(col, std_resid_s, lags=lags)
-        d["aic"]    = fit["aic"]
-        d["bic"]    = fit["bic"]
-        d["loglik"] = fit["loglik"]
-        p = fit["params"]
-        d["omega"]  = float(p.get("omega",    np.nan))
-        d["alpha"]  = float(p.get("alpha[1]", np.nan))
-        d["beta"]   = float(p.get("beta[1]",  np.nan))
-        diag_rows.append(d)
-
-    uni_diag = pd.DataFrame(diag_rows).set_index("asset")
-
-    # ── Step C: DCC ───────────────────────────────────────────────────────────
-    E_df   = z_df.dropna()
-    sig_cl = sigma_df.loc[E_df.index].dropna()
-    common_dcc = E_df.index.intersection(sig_cl.index)
-    E_df   = E_df.loc[common_dcc]
-    sig_cl = sig_cl.loc[common_dcc]
-
-    dcc_model = DCCGARCH().fit(E_df, sig_cl)
-
-    cols = list(returns.columns)
-    dcc_corr_dict: dict[str, list] = {}
-    for i in range(len(cols)):
-        for j in range(i + 1, len(cols)):
-            key = f"{cols[i]}|{cols[j]}"
-            dcc_corr_dict[key] = dcc_model.R_t_[:, i, j].tolist()
-
-    latest_matrix = dcc_model.R_t_[-1].tolist()
-    dcc_dates     = [str(d) for d in E_df.index]
-
-    # ── Step D: realized variance + VIX ──────────────────────────────────────
-    rv_proxy = realized_variance_proxy(returns, window=21)
-
-    vix_json = None
     try:
-        vix_prices = download_prices([VIX_TICKER], start, end)
-        vix_s      = vix_prices.squeeze().dropna()
-        vix_json   = json.dumps({
-            "dates": [str(d) for d in vix_s.index],
-            "values": vix_s.tolist(),
-        })
-    except Exception:
-        pass
+        tickers = UNIVERSES[universe]
+        lags    = int(lags) if lags else 20
 
-    # ── Step E: multivariate diagnostics ─────────────────────────────────────
-    comp_lb  = componentwise_ljungbox(E_df, lags=lags)
-    cross_lb = cross_product_portmanteau(E_df, lags=10)
+        # ── Step A: data ──────────────────────────────────────────────────────
+        prices  = download_prices(tickers, start, end)
+        if prices is None or prices.empty:
+            raise ValueError(
+                f"yfinance returned no price data for {tickers} "
+                f"({start} → {end}). Check tickers and date range."
+            )
+        returns = compute_log_returns(prices)
 
-    status = (
-        f"✅ Fitted on {len(returns):,} observations · "
-        f"{len(tickers)} assets · "
-        f"DCC a={dcc_model.a_:.4f}, b={dcc_model.b_:.4f}"
-    )
+        # Align all assets to common dates
+        common = returns.index.copy()
+        for c in returns.columns:
+            common = common.intersection(returns[c].dropna().index)
+        returns = returns.loc[common]
 
-    return (
-        _df_to_json(returns),
-        _df_to_json(sigma_df),
-        _df_to_json(z_df),
-        _df_to_json(uni_diag.reset_index()),
-        json.dumps({"a": dcc_model.a_, "b": dcc_model.b_, "loglik": dcc_model.loglik_}),
-        json.dumps({"corr": dcc_corr_dict, "dates": dcc_dates}),
-        json.dumps({"matrix": latest_matrix, "cols": cols}),
-        _df_to_json(rv_proxy),
-        vix_json,
-        _df_to_json(comp_lb),
-        _df_to_json(cross_lb),
-        json.dumps(tickers),
-        status,
-    )
+        if len(returns) < 100:
+            raise ValueError(
+                f"Only {len(returns)} common observations found — need at least 100. "
+                "Try a wider date range."
+            )
+
+        # ── Step B: univariate GARCH ──────────────────────────────────────────
+        sigma_df  = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
+        z_df      = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
+        diag_rows = []
+
+        for col in returns.columns:
+            series = returns[col].dropna()
+            fit    = fit_univariate_garch(series, dist=dist)
+
+            cond_vol_s  = pd.Series(fit["conditional_vol"], index=series.index)
+            std_resid_s = fit["std_resid"]
+
+            sigma_df[col] = cond_vol_s.reindex(returns.index)
+            z_df[col]     = std_resid_s.reindex(returns.index)
+
+            d = univariate_diagnostics(col, std_resid_s, lags=lags)
+            d["aic"]    = fit["aic"]
+            d["bic"]    = fit["bic"]
+            d["loglik"] = fit["loglik"]
+            p           = fit["params"]
+            d["omega"]  = float(p.get("omega",    np.nan))
+            d["alpha"]  = float(p.get("alpha[1]", np.nan))
+            d["beta"]   = float(p.get("beta[1]",  np.nan))
+            diag_rows.append(d)
+
+        uni_diag = pd.DataFrame(diag_rows).set_index("asset")
+
+        # ── Step C: DCC ───────────────────────────────────────────────────────
+        E_df       = z_df.dropna()
+        sig_cl     = sigma_df.loc[E_df.index].dropna()
+        common_dcc = E_df.index.intersection(sig_cl.index)
+        E_df       = E_df.loc[common_dcc]
+        sig_cl     = sig_cl.loc[common_dcc]
+
+        dcc_model  = DCCGARCH().fit(E_df, sig_cl)
+
+        cols          = list(returns.columns)
+        dcc_corr_dict = {}
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                dcc_corr_dict[f"{cols[i]}|{cols[j]}"] = dcc_model.R_t_[:, i, j].tolist()
+
+        latest_matrix = dcc_model.R_t_[-1].tolist()
+        dcc_dates     = [str(d) for d in E_df.index]
+
+        # ── Step D: realized variance + VIX ──────────────────────────────────
+        rv_proxy = realized_variance_proxy(returns, window=21)
+
+        vix_json = None
+        try:
+            vix_prices = download_prices([VIX_TICKER], start, end)
+            vix_s      = vix_prices.squeeze().dropna()
+            vix_json   = json.dumps({
+                "dates":  [str(d) for d in vix_s.index],
+                "values": vix_s.tolist(),
+            })
+        except Exception:
+            pass  # VIX is optional
+
+        # ── Step E: multivariate diagnostics ─────────────────────────────────
+        comp_lb  = componentwise_ljungbox(E_df, lags=lags)
+        cross_lb = cross_product_portmanteau(E_df, lags=10)
+
+        status = (
+            f"✅ {len(returns):,} obs · {len(tickers)} assets · "
+            f"DCC a={dcc_model.a_:.4f}, b={dcc_model.b_:.4f}"
+        )
+
+        return (
+            _df_to_json(returns),
+            _df_to_json(sigma_df),
+            _df_to_json(z_df),
+            _df_to_json(uni_diag.reset_index()),
+            json.dumps({"a": dcc_model.a_, "b": dcc_model.b_, "loglik": dcc_model.loglik_}),
+            json.dumps({"corr": dcc_corr_dict, "dates": dcc_dates}),
+            json.dumps({"matrix": latest_matrix, "cols": cols}),
+            _df_to_json(rv_proxy),
+            vix_json,
+            _df_to_json(comp_lb),
+            _df_to_json(cross_lb),
+            json.dumps(tickers),
+            status,
+            None,   # clear any previous error
+        )
+
+    except Exception as exc:
+        err_detail = traceback.format_exc()
+        err_msg    = f"{type(exc).__name__}: {exc}"
+        return (
+            *_no_data,
+            "❌ Model fitting failed — see error below.",
+            json.dumps({"msg": err_msg, "detail": err_detail}),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: show error alert when run_model fails
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("run-error", "children"),
+    Input("store-error", "data"),
+)
+def show_error(err_json):
+    if not err_json:
+        return None
+    err = json.loads(err_json)
+    return dbc.Alert([
+        html.B("Error: "), err["msg"],
+        html.Details([
+            html.Summary("Full traceback"),
+            html.Pre(err["detail"], style={"fontSize": "11px", "whiteSpace": "pre-wrap"}),
+        ], className="mt-2"),
+    ], color="danger", dismissable=True, className="small")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,8 +431,16 @@ def render_tab(
     comp_lb_j, cross_lb_j, tickers_j,
 ):
     _placeholder = dbc.Alert(
-        "Press ▶ Run Model to fetch data and fit the GARCH / DCC models. "
-        "Computation takes ~1–2 minutes for 11 assets over 10 years.",
+        [
+            html.B("Ready. "),
+            "Press ▶ Run Model in the sidebar to fetch data and fit the models. ",
+            html.Br(),
+            html.Small(
+                "Computation takes ~1–2 minutes for 11 assets over 10 years. "
+                "The button disables while running.",
+                className="text-muted",
+            ),
+        ],
         color="info",
     )
 

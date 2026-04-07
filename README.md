@@ -95,7 +95,23 @@ docker run -p 8050:8050 garch-dashboard
 
 The `render.yaml` file pre-configures the service name, Docker build, and the free plan.
 
-> **Note:** Model fitting on the free tier (512 MB RAM, shared CPU) takes roughly 1–2 minutes for 11 assets over 10 years. A progress spinner is shown while computing.
+> **Note:** Model fitting on the free tier (512 MB RAM, shared CPU) takes roughly 1–2 minutes for 11 assets over 10 years. The Run button disables itself while computing. Results appear when the job completes.
+
+### Long-running computation & timeouts
+
+The app uses **Dash background callbacks** (`diskcache`) so the computation runs in a background thread and the browser polls for the result via short requests. This bypasses Render's HTTP request timeout entirely.
+
+### Debugging on Render
+
+If the app misbehaves on Render, temporarily add this environment variable in your Render service settings:
+
+| Key | Value |
+|---|---|
+| `DASH_DEBUG` | `true` |
+
+This enables Dash's error overlay so you can see the full Python traceback in the browser. Remove it before going back to production.
+
+The sidebar also shows a red error card with the full traceback whenever model fitting fails (network error, bad ticker, etc.).
 
 ---
 

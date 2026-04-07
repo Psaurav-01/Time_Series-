@@ -1,5 +1,5 @@
 arch>=7.0.0
-dash>=2.14.0
+dash[diskcache]>=2.14.0
 dash-bootstrap-components>=1.5.0
 gunicorn>=21.0.0
 numpy>=1.26.0
