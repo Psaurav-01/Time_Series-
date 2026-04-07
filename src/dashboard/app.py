@@ -257,11 +257,10 @@ def run_model(n_clicks, universe, start, end, dist, lags):
             )
 
         returns = compute_log_returns(prices)
-        # keep only rows where ALL assets have data
-        common  = returns.index.copy()
-        for c in returns.columns:
-            common = common.intersection(returns[c].dropna().index)
-        returns = returns.loc[common]
+        # Ensure tz-naive, midnight-normalised index (defensive, mirrors garch.py)
+        returns.index = pd.to_datetime(returns.index).normalize()
+        # Keep only rows where ALL assets have a valid return
+        returns = returns.dropna(how="any")
 
         if len(returns) < 100:
             raise ValueError(
@@ -423,31 +422,43 @@ def render_tab(
     if not ret_j:
         return _placeholder
 
-    returns  = _json_to_df(ret_j)
-    sigma    = _json_to_df(sig_j)
-    z_df     = _json_to_df(z_j)
-    uni_diag = _json_to_df(udiag_j)
-    tickers  = json.loads(tickers_j)
+    try:
+        returns  = _json_to_df(ret_j)
+        sigma    = _json_to_df(sig_j)
+        z_df     = _json_to_df(z_j)
+        uni_diag = _json_to_df(udiag_j)
+        tickers  = json.loads(tickers_j)
 
-    if active_tab == "tab-garch":
-        return _tab_garch(returns, sigma, z_df, uni_diag, tickers)
+        if active_tab == "tab-garch":
+            return _tab_garch(returns, sigma, z_df, uni_diag, tickers)
 
-    if active_tab == "tab-diag":
-        return _tab_diagnostics(uni_diag)
+        if active_tab == "tab-diag":
+            return _tab_diagnostics(uni_diag)
 
-    if active_tab == "tab-dcc":
-        return _tab_dcc(
-            json.loads(dcc_corr_j)   if dcc_corr_j   else None,
-            json.loads(dcc_latest_j) if dcc_latest_j else None,
-            json.loads(dcc_params_j) if dcc_params_j else None,
-            tickers,
-        )
+        if active_tab == "tab-dcc":
+            return _tab_dcc(
+                json.loads(dcc_corr_j)   if dcc_corr_j   else None,
+                json.loads(dcc_latest_j) if dcc_latest_j else None,
+                json.loads(dcc_params_j) if dcc_params_j else None,
+                tickers,
+            )
 
-    if active_tab == "tab-vix":
-        return _tab_vix(sigma, _json_to_df(rv_j), vix_j, tickers)
+        if active_tab == "tab-vix":
+            return _tab_vix(sigma, _json_to_df(rv_j), vix_j, tickers)
 
-    if active_tab == "tab-multi":
-        return _tab_multi(z_df, _json_to_df(comp_lb_j), _json_to_df(cross_lb_j))
+        if active_tab == "tab-multi":
+            return _tab_multi(z_df, _json_to_df(comp_lb_j), _json_to_df(cross_lb_j))
+
+    except Exception as exc:
+        err_tb = traceback.format_exc()
+        return dbc.Alert([
+            html.B(f"Tab rendering error ({active_tab}): "),
+            str(exc),
+            html.Details([
+                html.Summary("Full traceback"),
+                html.Pre(err_tb, style={"fontSize": "11px", "whiteSpace": "pre-wrap"}),
+            ], className="mt-2"),
+        ], color="danger", dismissable=True, className="small")
 
     return _placeholder
 
@@ -534,13 +545,18 @@ def _tab_garch(returns, sigma, z_df, uni_diag, tickers):
     Input("store-sigma",       "data"),
     Input("store-std-resid",   "data"),
     Input("store-returns",     "data"),
-    prevent_initial_call=True,
 )
 def _update_garch_asset(asset, sig_j, z_j, ret_j):
+    _empty  = go.Figure()
+    if not asset or not sig_j or not z_j or not ret_j:
+        return _empty, _empty, _empty, _empty
+
     sigma   = _json_to_df(sig_j)
     z_df    = _json_to_df(z_j)
     returns = _json_to_df(ret_j)
-    _empty  = go.Figure()
+
+    if sigma is None or z_df is None or returns is None:
+        return _empty, _empty, _empty, _empty
 
     if asset not in sigma.columns:
         return _empty, _empty, _empty, _empty
@@ -705,11 +721,10 @@ def _tab_dcc(dcc_corr_data, dcc_latest_data, dcc_params, tickers):
     Output("dcc-pair-chart", "figure"),
     Input("dcc-pair-pick",  "value"),
     Input("store-dcc-corr", "data"),
-    prevent_initial_call=True,
 )
 def _update_dcc_pair(pair, dcc_corr_j):
     if not pair or not dcc_corr_j:
-        raise dash.exceptions.PreventUpdate
+        return go.Figure()
 
     data   = json.loads(dcc_corr_j)
     corr   = data["corr"].get(pair, [])

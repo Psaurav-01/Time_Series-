@@ -92,8 +92,12 @@ def download_prices(tickers, start, end):
                 hist = t.history(start=start, end=end, auto_adjust=True)
                 if not hist.empty:
                     close = hist["Close"].copy()
+                    # Strip tz then normalise to midnight so all tickers share
+                    # the same index format (yfinance returns mixed timestamps
+                    # on cloud hosts which makes intersection empty otherwise).
                     if hasattr(close.index, "tz") and close.index.tz is not None:
                         close.index = close.index.tz_localize(None)
+                    close.index = close.index.normalize()
                     frames[ticker] = close
                     break
                 elif attempt == 2:
@@ -121,6 +125,7 @@ def download_prices(tickers, start, end):
                     close_batch = close_batch.to_frame(name=failed[0])
                 if hasattr(close_batch.index, "tz") and close_batch.index.tz is not None:
                     close_batch.index = close_batch.index.tz_localize(None)
+                close_batch.index = close_batch.index.normalize()
                 for col in close_batch.columns:
                     frames[col] = close_batch[col]
         except Exception:
@@ -133,15 +138,22 @@ def download_prices(tickers, start, end):
         )
 
     data = pd.DataFrame(frames)
+    # Final normalisation: ensure a clean, tz-naive, midnight DatetimeIndex
+    data.index = pd.to_datetime(data.index).normalize()
     data = data.sort_index().dropna(how="all")
     return data
 
 
 def compute_log_returns(prices):
     """
-    Compute daily log returns.
+    Compute daily log returns (log-difference of adjusted close).
+    Drops only the first NaN row introduced by shift; keeps rows where
+    at least one asset has data so no extra observations are lost here.
+    The caller is responsible for cross-asset alignment.
     """
-    rets = np.log(prices / prices.shift(1)).dropna()
+    rets = np.log(prices / prices.shift(1))
+    rets = rets.iloc[1:]        # drop the first all-NaN row from shift
+    rets = rets.dropna(how="all")  # drop rows that are entirely NaN
     return rets
 
 
