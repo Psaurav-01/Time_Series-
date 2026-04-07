@@ -98,6 +98,8 @@ def download_prices(tickers, start, end):
                     if hasattr(close.index, "tz") and close.index.tz is not None:
                         close.index = close.index.tz_localize(None)
                     close.index = close.index.normalize()
+                    # Remove any duplicate dates produced by DST transitions
+                    close = close[~close.index.duplicated(keep="last")]
                     frames[ticker] = close
                     break
                 elif attempt == 2:
@@ -126,6 +128,7 @@ def download_prices(tickers, start, end):
                 if hasattr(close_batch.index, "tz") and close_batch.index.tz is not None:
                     close_batch.index = close_batch.index.tz_localize(None)
                 close_batch.index = close_batch.index.normalize()
+                close_batch = close_batch[~close_batch.index.duplicated(keep="last")]
                 for col in close_batch.columns:
                     frames[col] = close_batch[col]
         except Exception:
@@ -140,6 +143,8 @@ def download_prices(tickers, start, end):
     data = pd.DataFrame(frames)
     # Final normalisation: ensure a clean, tz-naive, midnight DatetimeIndex
     data.index = pd.to_datetime(data.index).normalize()
+    # Remove any duplicate dates (can arise from DST when tickers have tz-aware indices)
+    data = data[~data.index.duplicated(keep="last")]
     data = data.sort_index().dropna(how="all")
     return data
 

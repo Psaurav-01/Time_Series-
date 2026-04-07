@@ -260,7 +260,11 @@ def run_model(n_clicks, universe, start, end, dist, lags):
         returns = compute_log_returns(prices)
         # Ensure tz-naive, midnight-normalised index (defensive, mirrors garch.py)
         returns.index = pd.to_datetime(returns.index).normalize()
-        # Keep only rows where ALL assets have a valid return
+        # Remove duplicate dates (can arise from DST tz normalisation)
+        returns = returns[~returns.index.duplicated(keep="last")]
+        # Drop tickers whose entire column is NaN (failed download)
+        returns = returns.dropna(how="all", axis=1)
+        # Keep only rows where ALL remaining assets have a valid return
         returns = returns.dropna(how="any")
 
         if len(returns) < 100:
